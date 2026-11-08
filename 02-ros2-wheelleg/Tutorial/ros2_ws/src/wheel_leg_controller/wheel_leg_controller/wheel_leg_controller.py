@@ -1,4 +1,5 @@
 import rclpy
+import math
 import numpy as np
 
 from rclpy.node import Node
@@ -30,8 +31,9 @@ class WheelLegController(Node):
         self.joit_sub = self.create_subscription(JointState, 'joint_states', self.joint_callback, 10)
 
         # 5. 创建 Timer
-        self.timer = self.create_timer(0.01, self.control_loop)
-        self.get_logger().info('WheelLegController started')
+        self.dt = 0.02
+        self.sim_time = 0.0
+        self.timer = self.create_timer(self.dt, self.control_loop)
 
     # 6. IMU 回调函数
     def imu_callback(self, msg):
@@ -51,14 +53,38 @@ class WheelLegController(Node):
 
     # 8. 控制循环
     def control_loop(self):
+        # 8.1 检查传感器数据是否准备好
         if not self.imu_received or not self.joint_state_received:
             return
 
+        # 8.2 第一次运行时输出传感器状态
         if not self.state_ready_logged:
             self.get_logger().info(f'Angular velocity: {self.angular_velocity}')
-            self.get_logger().info(f'Joint position: {self.joint_position}')
-            self.get_logger().info(f'Joint velocity: {self.joint_velocity}')
+            self.get_logger().info(f'Joint positions: {self.joint_position}')
+            self.get_logger().info(f'Joint velocities: {self.joint_velocity}')
             self.state_ready_logged = True
+
+        # 8.3 更新时间
+        self.sim_time += self.dt
+
+        # 8.4 计算一个小幅度正弦力矩
+        wheel_torque = 0.2 * math.sin(2.0 * math.pi * 0.5 * self.sim_time)
+
+        # 8.5 创建执行器指令消息
+        cmd = WheelLegCmd()
+
+        # 8.6 腿部四个执行器暂时设置为零力矩
+        cmd.right_phi1 = 0.0
+        cmd.right_phi4 = 0.0
+        cmd.left_phi1 = 0.0
+        cmd.left_phi4 = 0.0
+
+        # 8.7 左右轮执行器施加相反方向力矩
+        cmd.right_wheel = -wheel_torque
+        cmd.left_wheel = wheel_torque
+
+        # 8.8 发布消息
+        self.cmd_pub.publish(cmd)
 
 def main(args = None):
         rclpy.init(args = args)
