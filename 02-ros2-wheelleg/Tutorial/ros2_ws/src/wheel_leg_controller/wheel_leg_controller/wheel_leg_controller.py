@@ -1,6 +1,8 @@
 import rclpy
 import math
 import numpy as np
+import time
+from geometry_msgs.msg import Twist
 
 from rclpy.node import Node
 from sensor_msgs.msg import Imu, JointState
@@ -21,6 +23,20 @@ class WheelLegController(Node):
         self.joint_state_received = False
         self.state_ready_logged = False
 
+        self.wheel_radius = 0.06
+        self.dt = 0.002
+
+        self.kp = 0.05
+        self.ki = 0.1
+
+        self.left_integral = 0.0
+        self.right_integral = 0.0
+
+        self.target_linear_v = 0.0
+        self.last_cmd_time = None
+
+        self.debug_counter = 0
+
         # 2. 创建Publisher
         self.cmd_pub = self.create_publisher(WheelLegCmd, 'actuator_cmd', 10)
 
@@ -31,17 +47,19 @@ class WheelLegController(Node):
         self.joit_sub = self.create_subscription(JointState, 'joint_states', self.joint_callback, 10)
 
         # 5. 创建 Timer
-        self.dt = 0.02
         self.sim_time = 0.0
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-    # 6. IMU 回调函数
+        # 6. 创建cmd_vel Subscriber
+        self.cmd_vel_sub = self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+
+    # 7. IMU 回调函数
     def imu_callback(self, msg):
         self.orientation = np.array([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
         self.angular_velocity = np.array([msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z])
         self.imu_received = True
 
-    # 7. JointState 回调函数
+    # 8. JointState 回调函数
     def joint_callback(self, msg):
         if len(msg.position) != 6 or len(msg.velocity) != 6:
             self.get_logger().warning('Unexpected joint state length')
@@ -51,40 +69,85 @@ class WheelLegController(Node):
         self.joint_velocity = np.array(msg.velocity)
         self.joint_state_received = True
 
-    # 8. 控制循环
+    # 9. 控制循环
     def control_loop(self):
-        # 8.1 检查传感器数据是否准备好
+        # 9.1 等待传感器数据准备好
         if not self.imu_received or not self.joint_state_received:
             return
 
-        # 8.2 第一次运行时输出传感器状态
-        if not self.state_ready_logged:
-            self.get_logger().info(f'Angular velocity: {self.angular_velocity}')
-            self.get_logger().info(f'Joint positions: {self.joint_position}')
-            self.get_logger().info(f'Joint velocities: {self.joint_velocity}')
-            self.state_ready_logged = True
+        # 9.2 获取目标速度
+        # 超过1秒没有收到目标指令，目标自动回到0
+        if (self.last_cmd_time is None or time.monotonic() - self.last_cmd_time > 1.0):
+            target_v = 0.0
+        else:
+            target_v = self.target_linear_v
 
-        # 8.3 更新时间
-        self.sim_time += self.dt
+        # 9.3 线速度转换为目标角速度
+        target_omega = target_v / self.wheel_radius
 
-        # 8.4 计算一个小幅度正弦力矩
-        wheel_torque = 0.2 * math.sin(2.0 * math.pi * 0.5 * self.sim_time)
+        # 9.4 读取左右轮实际角速度
+        right_actual = float(self.joint_velocity[4])
+        left_actual = float(self.joint_velocity[5])
 
-        # 8.5 创建执行器指令消息
+        # 9.5 计算轮速误差
+        right_error = -target_omega - right_actual
+        left_error = target_omega - left_actual
+
+        # 9.6 更新积分项
+        self.right_integral += right_error * self.dt
+        self.left_integral += left_error * self.dt
+
+        # 简单积分限幅，避免积分无限增大
+        self.right_intergral = max(-10.0, min(10.0, self.right_integral))
+        self.left_integral = max(-10.0, min(10.0, self.left_integral))
+
+        # 9.7 PI计算
+        right_torque = (self.kp * right_error + self.ki * self.right_integral)
+        left_torque = (self.kp * left_error + self.ki * self.left_integral)
+
+        # 9.8 电机力矩限幅
+        right_torque = max(-2.0, min(2.0, right_torque))
+        left_torque = max(-2.0, min(2.0, left_torque))
+
+        # 9.9 创建并发布执行器指令
         cmd = WheelLegCmd()
 
-        # 8.6 腿部四个执行器暂时设置为零力矩
         cmd.right_phi1 = 0.0
         cmd.right_phi4 = 0.0
         cmd.left_phi1 = 0.0
         cmd.left_phi4 = 0.0
 
-        # 8.7 左右轮执行器施加相反方向力矩
-        cmd.right_wheel = -wheel_torque
-        cmd.left_wheel = wheel_torque
+        cmd.right_wheel = right_torque
+        cmd.left_wheel = left_torque
 
-        # 8.8 发布消息
         self.cmd_pub.publish(cmd)
+
+        # 9.10 定期打印状态，便于调试
+        self.debug_counter += 1
+
+        if self.debug_counter % 250 == 0:
+            if abs(target_omega) > 1e-6:
+
+                #左右轮目标角速度
+                right_target = -target_omega
+                left_target = target_omega
+
+                #计算相对误差
+                right_error_rate = (abs(right_target - right_actual) / abs(right_target) * 100)
+                left_error_rate = (abs(left_target - left_actual) / abs(left_target) * 100)
+
+                self.get_logger().info(
+                    f"Target v = {target_v:.2f} m/s | "
+                    f"Right = {right_actual:.2f} rad/s "
+                    f"(error {right_error_rate:.1f}%) | "
+                    f"Left = {left_actual:.2f} rad/s "
+                    f"(error {left_error_rate:.1f}%)"
+                )
+
+    # 10. cmd_vel 回调函数
+    def cmd_vel_callback(self, msg):
+        self.target_linear_v = msg.linear.x
+        self.last_cmd_time = time.monotonic()
 
 def main(args = None):
         rclpy.init(args = args)
